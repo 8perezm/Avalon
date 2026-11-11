@@ -323,6 +323,10 @@ __attribute__((constructor)) static void ggml_hip_set_hw_queues() {
     setenv("ROCBLAS_DEVICE_MEMORY_SIZE", "65536", /*overwrite =*/ 0);
     setenv("HSA_SCRATCH_SINGLE_LIMIT", "1048576", /*overwrite =*/ 0);
     setenv("GPU_PINNED_MIN_XFER_SIZE", "1048576", /*overwrite =*/ 0);
+    // the prompt's expert ring (GGML_CUDA_MOE_RING_PREFILL, as on NVIDIA below): RX 7900 XT, 262k context with MTP, ABBA,
+    // prefill and steps as with the prefetch's 4 slots, 900 MiB lent by the cache during a prefill instead of 1 800 and
+    // ~10 % fewer entries moved and evicted per loan. Not measured on Windows. An explicit value is kept, 0 turns it off.
+    setenv("GGML_CUDA_MOE_RING_PREFILL", "900", /*overwrite =*/ 0);
 #endif
 }
 #elif !defined(GGML_USE_MUSA) && !defined(_WIN32)
@@ -1265,27 +1269,23 @@ struct ggml_backend_cuda_borrowed_buffer_type_context {
 };
 
 static size_t ggml_backend_cuda_borrowed_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
-    // the cache lends contiguous runs of one pool: ask ggml-alloc for chunks it can serve
+    // the cache lends contiguous runs: ask ggml-alloc for chunks it can serve, the largest piece the device lends now
+    // (the bands: all of the slab's free room, a graph's buffer in one chunk; pools apart: 1 GiB at most, see
+    // moe_cache_largest_lend), rounded down to 64 MiB, 256 MiB at least (a single larger tensor keeps a chunk of its
+    // own: ggml-alloc never splits a tensor). GGML_SCHED_BORROW_CHUNK_MB=N: N MiB at most. Chunks of 1 GiB at most
+    // with the bands lost up to 400 MiB to placement (tensors of 200 - 670 MiB at a 9536-token ubatch)
     static const size_t max_chunk = [] () -> size_t {
         const char * text = getenv("GGML_SCHED_BORROW_CHUNK_MB");
         const long long value = text && text[0] ? atoll(text) : 0;
-        // 1 GiB: the loan plan seats every chunk list it can (see moe_cache_plan_borrows), so
-        // the limit only trades fragmentation against how finely chunks spread over the
-        // pools. Measured on the qwen4exp graph (7.2 GiB in one piece): 512 MiB chunks lose
-        // 654 MiB to fragmentation, 1 GiB 292 MiB at the same most-lent pool (71 %), 2 GiB
-        // 237 MiB but 77 %. Measured, not derived: the best value moves with the graph.
-        return (value > 0 ? (size_t)value : 1024) << 20;
+        return value > 0 ? (size_t)value << 20 : SIZE_MAX;
     }();
-    // on a small card no pool lends that much in one piece (12 GB at 131k: the largest ~900 MiB): chunks of what
-    // the largest pool can lend now, rounded down to 64 MiB, 256 MiB at least (a single larger tensor keeps a chunk
-    // of its own: ggml-alloc never splits a tensor)
     const auto * ctx = (const ggml_backend_cuda_borrowed_buffer_type_context *) buft->context;
     const size_t lend = ggml_moe_cache.largest_lend ? ggml_moe_cache.largest_lend(ctx->session, ctx->backend) : 0;
     if (lend > 0) {
         const size_t mib64 = (size_t) 64 << 20;
         return std::min(max_chunk, std::max<size_t>((size_t) 256 << 20, lend / mib64 * mib64));
     }
-    return max_chunk;
+    return std::min(max_chunk, (size_t) 1 << 30);
 }
 
 static ggml_backend_buffer_t ggml_backend_cuda_borrowed_buffer_type_alloc_buffer(
@@ -5496,6 +5496,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     const char * b0 = (const char *) in->data,  * b1 = b0 + ggml_nbytes(in);
                     return !(a0 < b1 && b0 < a1) || (exact_ok && a0 == b0 && a1 == b1);
                 };
+                // the hyper-connection combine + norm that reads the block output computes it (qwen4exp), as the
+                // unsummed block's below: the summed row with weight 1
+                const int with_k1 = ggml_cuda_qwen4_hc_fuse_reduction_k1(*cuda_ctx, cgraph, i, add_idx + 1,
+                    [](const ggml_cgraph * g, int idx, int n, const int * outs, int n_outs) {
+                        return ggml_cuda_check_fusion_memory_ranges(g, idx, n, outs, n_outs);
+                    }, summed, nullptr, nullptr, sh, logit);
+                if (with_k1 > 0) {
+                    return with_k1;
+                }
                 if (ggml_can_fuse_subgraph_ext(cgraph, nodes3, 3, ops3, &add_idx, 1) &&
                         range_ok(summed, true) && range_ok(sh, true) && range_ok(logit, false)) {
                     ggml_cuda_op_moe_weighted_reduction(*cuda_ctx, summed, nullptr, nullptr, add, sh, logit);
@@ -6667,6 +6676,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             // the inject's 4 values per token may not take the block output's memory (freed by hc_post, often given to
             // them by ggml-alloc: 37 of 186 boundaries at 19k): a block writes them while others still read bo, so the
             // product runs apart then, from the image (the values of a product in F16 instead of F32, as before e917e6e53)
+            // (ggml_backend_cuda_graph_optimize keeps the block output, the residual and the raw gate alive until mm)
             if (residual->type == GGML_TYPE_F32 && residual->nb[0] == sizeof(float) && ggml_cuda_is_aligned(residual, 16) &&
                     residual->nb[1] % 16 == 0 && residual->nb[2] % 16 == 0 && ggml_are_same_shape(residual, post) &&
                     ggml_can_fuse_subgraph_ext(cgraph, nodes, 7, ops, outputs, 3) &&
@@ -7805,6 +7815,42 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     };
 
     if (!disable_fusion) {
+        // the gated hc_post + RMS_NORM + MUL (+ the inject product) kernel reads the block output, the residual and the
+        // raw gate while writing the new residual, the normalized streams and the inject: kept alive until its last node,
+        // so that ggml-alloc does not give their memory to those outputs (it did at most boundaries of the second prompt
+        // batch with LLAMA_MOE_DOWN_SUM, refusing the fusion)
+        // only tensors computed by this graph's nodes: an input (the first boundary's residual, the MTP draft's states
+        // from the main model) is the scheduler's to copy and keep
+        std::unordered_set<const ggml_tensor *> computed;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            computed.insert(cgraph->nodes[i]);
+        }
+        const auto keep = [&](ggml_tensor * t, ggml_tensor * until) {
+            const ggml_tensor * base = t->view_src ? t->view_src : t;
+            if (computed.count(base)) {
+                params->add_alloc_dep(params->user_data, t, until);
+            }
+        };
+        for (int i = 0; i + 5 < cgraph->n_nodes; ++i) {
+            ggml_tensor * post = cgraph->nodes[i + 3];
+            ggml_tensor * rms  = cgraph->nodes[i + 4];
+            ggml_tensor * mul  = cgraph->nodes[i + 5];
+            if (cgraph->nodes[i]->op != GGML_OP_SCALE || cgraph->nodes[i + 1]->op != GGML_OP_UNARY ||
+                    cgraph->nodes[i + 2]->op != GGML_OP_SCALE || post->op != GGML_OP_DSV4_HC_POST || rms->op != GGML_OP_RMS_NORM ||
+                    mul->op != GGML_OP_MUL || rms->src[0] != post || mul->src[0] != rms) {
+                continue;
+            }
+            int k = i + 6;
+            while (k < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+                k++;
+            }
+            ggml_tensor * until = k < cgraph->n_nodes && cgraph->nodes[k]->op == GGML_OP_MUL_MAT ? cgraph->nodes[k] : mul;
+            keep(post->src[0], until);
+            keep(post->src[1], until);   // the residual: otherwise partly under them
+            keep(cgraph->nodes[i]->src[0], until);
+        }
+    }
+    if (!disable_fusion) {
         ggml_cuda_qwen4_hc_alloc_deps(cgraph, params->add_alloc_dep, params->user_data);
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
@@ -7831,7 +7877,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         }
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             // the l2 norm of q and k right after the cached conv (computed by the conv's kernel): the conv's inputs
-            // (window, new tokens) live until the norm's last node, which is never placed over them
+            // (window, new tokens) live until the norm's last node, which is never placed over them. Not the window
+            // (the CONCAT) itself: the cached conv reads its sources (the state rows, the new tokens), never it; kept, its
+            // 373 MiB at a 9536-token ubatch were the peak of the GDN layers
             if (cgraph->nodes[i]->op == GGML_OP_RMS_NORM && i + 1 < cgraph->n_nodes) {
                 const ggml_tensor * v = cgraph->nodes[i]->src[0];
                 const ggml_tensor * conv_out = v->view_src;
@@ -7844,7 +7892,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                         if (!in) {
                             continue;
                         }
-                        params->add_alloc_dep(params->user_data, in, sc);
+                        if (in->op != GGML_OP_CONCAT) {
+                            params->add_alloc_dep(params->user_data, in, sc);
+                        }
                         for (int b = 0; b < GGML_MAX_SRC; b++) {
                             if (in->src[b]) {
                                 params->add_alloc_dep(params->user_data, in->src[b], sc);
