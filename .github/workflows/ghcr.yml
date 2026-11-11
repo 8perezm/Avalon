@@ -19,11 +19,11 @@ on:
         description: Push the image to GHCR
         type: boolean
         default: true
-  push:
-    branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'media/**'
+  # push:
+  #   branches: [main]
+  #   paths-ignore:
+  #     - '**.md'
+  #     - 'media/**'
 
 permissions:
   contents: read
